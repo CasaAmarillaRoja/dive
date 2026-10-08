@@ -443,6 +443,8 @@ function ensurePiEventChannel() {
   // EventSource reconnects automatically on error.
 }
 
+// Events that mean Pi is working: they open a background run, which keeps the
+// composer busy until its done or error.
 const PI_CHANNEL_SUBSTANTIVE = new Set([
   "delta",
   "thinking_start",
@@ -453,9 +455,6 @@ const PI_CHANNEL_SUBSTANTIVE = new Set([
   "tool_end",
   "tool_call_update",
   "web_sources",
-  "pi_widget",
-  "pi_status",
-  "pi_notice",
   "pi_usage",
   "async_pending",
   "provider_retry",
@@ -466,6 +465,136 @@ const PI_CHANNEL_SUBSTANTIVE = new Set([
   "stderr",
   "trace",
 ]);
+// Extension notices, status lines and widget frames. The server also sends
+// these with no session at all, after the reply has settled, and no done ever
+// follows them, so those must never open a background run: it would never
+// end, and the composer would stay busy. With no run open, each one is shown
+// and saved with the last answer at once (addPassivePiRecord). One that
+// carries a session belongs to a turn still running, whose done will come.
+const PI_CHANNEL_PASSIVE = new Set(["pi_widget", "pi_status", "pi_notice"]);
+
+// The last answer in a history, and its bubble. A turn with neither text nor
+// sources has none (the rule renderAssistantHistoryMessage applies).
+function piLastAnswer(turns) {
+  const index = turns.findLastIndex((message) => message?.role === "assistant");
+  const answer = index >= 0 ? turns[index] : null;
+  const hasBubble =
+    !!answer &&
+    assistantBubbleHasContent(answer.content, getMessageLibrarySources(answer));
+  const bubbles = chat.querySelectorAll(".msg-wrap.assistant > .msg.assistant");
+  return {
+    index,
+    bubble: hasBubble ? bubbles[bubbles.length - 1] || null : null,
+  };
+}
+
+// Whether a trace block belongs to the given answer bubble: it sits directly
+// above it or, for an answer with no bubble, at the end of the chat.
+function piTraceBlockPrecedes(controller, bubble) {
+  const block = controller?.isConnected ? controller.element : null;
+  if (!block) return false;
+  if (!bubble) return block === chat.lastElementChild;
+  return block.nextElementSibling === bubble.closest(".msg-wrap");
+}
+
+// Whether a replayed passive record is already saved in the conversation. A
+// page load replays every buffered record; the ones an earlier page saved
+// carry their channel epoch and sequence. A widget keeps only its latest
+// frame, so a saved frame of that widget at or after this one covers it.
+function piPassiveRecordSaved(turns, evt) {
+  if (evt.replay !== true || !evt.epoch) return false;
+  if (!Number.isSafeInteger(evt.sequence)) return false;
+  return turns.some((message) =>
+    (Array.isArray(message?.traceEvents) ? message.traceEvents : []).some(
+      (saved) =>
+        saved?.epoch === evt.epoch &&
+        saved.type === evt.type &&
+        Number.isSafeInteger(saved.sequence) &&
+        (evt.type === "pi_widget"
+          ? saved.key === evt.key && saved.sequence >= evt.sequence
+          : saved.sequence === evt.sequence),
+    ),
+  );
+}
+
+// An answer's saved trace events plus one passive record, by the rules its
+// live trace block uses (addEvent in 05-history.js): only the latest frame
+// of each widget, and no clear frames.
+function addPassivePiRecordToEvents(traceEvents, evt) {
+  let events = traceEvents;
+  if (evt.type === "pi_widget") {
+    if (!Array.isArray(evt.lines) || !evt.lines.length) return events;
+    events = events.filter(
+      (saved) => !(saved?.type === "pi_widget" && saved.key === evt.key),
+    );
+  }
+  const copy = { ...evt };
+  delete copy.thinking;
+  delete copy.response;
+  delete copy.sessionId;
+  return [...events, copy];
+}
+
+// Show a passive record and save it with the last answer, at once. It is only
+// ever added to that answer's saved trace, never written over it. It appears
+// in the answer's own trace block, or, when that block is not on screen
+// (after a slash command, a reload or a switch of conversation), in one block
+// of its own above the answer.
+function addPassivePiRecord(session, evt) {
+  const turns = Array.isArray(session.history) ? session.history : [];
+  if (piPassiveRecordSaved(turns, evt)) return;
+  // A history reconcile in flight will replace the history this is saved
+  // into; it is applied again once that lands.
+  session.piReplayedDuringReconcile?.push(evt);
+  const { index, bubble } = piLastAnswer(turns);
+  let block = [session.lastThinkingController, session.piPassiveBlock].find(
+    (candidate) => piTraceBlockPrecedes(candidate, bubble),
+  );
+  if (!block) {
+    const showsNothing =
+      evt.type === "pi_widget"
+        ? !Array.isArray(evt.lines) || !evt.lines.length
+        : evt.type === "pi_status" && !evt.text;
+    if (showsNothing) return;
+    block = addThinking({
+      live: false,
+      modeName: "pi",
+      convId: session.convId || currentConvId,
+    });
+    const answerWrap = bubble?.closest(".msg-wrap");
+    if (answerWrap?.parentElement && block.element) {
+      answerWrap.parentElement.insertBefore(block.element, answerWrap);
+    }
+    // Kept apart from lastThinkingController: a background run reusing this
+    // block would write its partial snapshot over the answer's saved trace.
+    session.piPassiveBlock = block;
+  }
+  const linesBefore = block.getSnapshot().traceLines.length;
+  handleStreamEventTrace(evt, block);
+  if (index < 0) return;
+  const answer = turns[index];
+  const savedLines =
+    Array.isArray(answer.traceLines) && answer.traceLines.length
+      ? answer.traceLines
+      : getAssistantMetadataFromMessage(answer).traceLines;
+  const next = [...turns];
+  next[index] = {
+    ...answer,
+    traceLines: [
+      ...savedLines,
+      ...block.getSnapshot().traceLines.slice(linesBefore),
+    ],
+    traceEvents: addPassivePiRecordToEvents(
+      Array.isArray(answer.traceEvents) ? answer.traceEvents : [],
+      evt,
+    ),
+  };
+  session.history = next;
+  if (mode === "pi" && currentConvId === session.convId) {
+    history = [...next];
+  }
+}
+
 function handlePiChannelEvent(evt) {
   if (!evt || typeof evt.type !== "string") return;
   const session = getActiveModeSession("pi");
@@ -481,15 +610,16 @@ function handlePiChannelEvent(evt) {
   // channel only takes over when no run is attached. Sequence IDs are
   // still recorded above so reconnects do not replay its events.
   if (session.activeAbortController) return;
-  // Completed historical runs are already represented in conversation
-  // history. Their replay records are for reconciliation only, never a
-  // reason to create a duplicate background assistant bubble.
-  if (evt.replay === true && evt.completed === true && !piChannelRun) {
+  // Completed runs are already represented in conversation history, or were
+  // rendered by the stream that ran them. Their records, live or replayed,
+  // never start a run.
+  if (evt.completed === true && !piChannelRun) {
     return;
   }
   if (evt.type === "replay_gap") {
     if (!session.piReplayReconcile) {
       session.piReplayReconcile = true;
+      session.piReplayedDuringReconcile = [];
       fetch(
         apiUrl("/api/conversations/id/" + encodeURIComponent(session.convId)),
       )
@@ -505,21 +635,33 @@ function handlePiChannelEvent(evt) {
             session.history = [...conversation.history];
             history = [...session.history];
             renderSessionTranscript(session);
+            // Records shown while the fetch was out were saved into the
+            // history it just replaced.
+            const replayed = session.piReplayedDuringReconcile || [];
+            session.piReplayedDuringReconcile = null;
+            replayed.forEach((record) => addPassivePiRecord(session, record));
           }
         })
         .catch(uiRefreshFailed("Pi history reconcile"))
         .finally(() => {
           session.piReplayReconcile = false;
+          session.piReplayedDuringReconcile = null;
         });
     }
     return;
   }
   if (!piChannelRun) {
-    if (!PI_CHANNEL_SUBSTANTIVE.has(evt.type)) return;
+    const uiRecord = PI_CHANNEL_PASSIVE.has(evt.type);
+    if (!uiRecord && !PI_CHANNEL_SUBSTANTIVE.has(evt.type)) return;
+    const passive = uiRecord && !evt.sessionId;
     // Straggler gate: the SSE socket can deliver a run's trailing
     // events moments after the prompt stream already finalized it —
-    // don't resurrect that turn as a spurious continuation.
-    if (Date.now() - (session.lastRunEndedAt || 0) < 1500) return;
+    // don't resurrect that turn as a spurious continuation. A record
+    // with no session never travelled on a prompt stream, so it is
+    // never a straggler.
+    if (!passive && Date.now() - (session.lastRunEndedAt || 0) < 1500) {
+      return;
+    }
     // A dangling draft from an earlier turn must be committed first,
     // or this continuation would stream into its bubble above the
     // current position.
@@ -533,10 +675,26 @@ function handlePiChannelEvent(evt) {
         }
       }
     }
+    if (passive) {
+      addPassivePiRecord(session, evt);
+      return;
+    }
     session.thinkingStartedAt = Date.now();
-    const priorController = session.lastThinkingController?.isConnected
-      ? session.lastThinkingController
-      : null;
+    // Reuse the last trace block only if it belongs to the last answer and
+    // holds its whole trace: finalize writes a reused block's snapshot over
+    // the answer's saved trace. After a Dive slash command the block belongs
+    // to an earlier answer; a block an earlier background run had to create
+    // holds only that run's part.
+    const lastController = session.lastThinkingController;
+    const priorController =
+      !lastController?.piPartialTrace &&
+      piTraceBlockPrecedes(
+        lastController,
+        piLastAnswer(Array.isArray(session.history) ? session.history : [])
+          .bubble,
+      )
+        ? lastController
+        : null;
     const controller =
       priorController ||
       addThinking({
@@ -545,6 +703,7 @@ function handlePiChannelEvent(evt) {
         modeName: "pi",
         convId: session.convId || currentConvId,
       });
+    if (!priorController) controller.piPartialTrace = true;
     const reusedController = !!priorController;
     session.thinkingController = controller;
     controller.addTraceLine(
