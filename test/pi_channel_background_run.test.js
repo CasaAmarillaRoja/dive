@@ -150,6 +150,8 @@ function makeClient() {
   const chat = new Element("div");
   chat.isRoot = true;
   const fetches = [];
+  // What GET /api/conversations/id/... returns.
+  let serverHistory = [];
   const session = {
     convId: "conv_test",
     activeAbortController: null,
@@ -188,7 +190,15 @@ function makeClient() {
     basenameFromPath: (value) => String(value || "").split("/").pop(),
     uiRefreshFailed: () => () => {},
     apiUrl: (value) => value,
+    renderSessionTranscript() {},
+    readJsonResponse: (response) => response.json(),
     fetch: (url) => {
+      if (url.startsWith("/api/conversations/id/")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ id: "conv_test", history: serverHistory }),
+        });
+      }
       fetches.push(url);
       return Promise.resolve({ ok: true });
     },
@@ -201,6 +211,7 @@ function makeClient() {
       ...HISTORY_FUNCTIONS.map((name) => extractFunction(historySource, name)),
       extractFunction(chatSource, "isGenerationActive"),
       extractFunction(chatSource, "abortActiveGeneration"),
+      extractFunction(chatSource, "reloadOpenConversationFromServer"),
     ].join("\n"),
     context,
     { filename: "05-07-extract.js" },
@@ -244,9 +255,20 @@ function makeClient() {
       session.lastThinkingController = exchange(question, answer);
     },
     deliver(evt) {
-      context.__evt = { convId: "conv_test", sequence: ++sequence, ...evt };
+      context.__evt = {
+        convId: "conv_test",
+        epoch: "e1",
+        sequence: ++sequence,
+        ...evt,
+      };
       run("handlePiChannelEvent(__evt)");
     },
+    setServerHistory(turns) {
+      serverHistory = turns;
+    },
+    // The page reloading the open conversation after a server-side save.
+    reload: () => run("reloadOpenConversationFromServer('conv_test')"),
+    run,
     runOpen: () => run("piChannelRun !== null"),
     busy: () => run("isGenerationActive()"),
     stop: () => run("abortActiveGeneration()"),
@@ -483,4 +505,212 @@ test("a notice during a live background turn is handed to that turn", () => {
   assert.equal(client.busy(), true);
   client.deliver(WAKE_DONE);
   assert.ok(kinds(client.turn(1)).includes("pi_notice:Saved"));
+});
+
+// The server's copy after it saved a background turn: the answer with the
+// turn's steps appended, and none of the notices the page showed.
+const SAVED_WAKE = [
+  { type: "tool_start", toolName: "read", toolCallId: "w1" },
+  { type: "tool_end", toolName: "read", toolCallId: "w1" },
+];
+const serverCopyAfterWake = (extraEvents = []) => [
+  { role: "user", content: "q1" },
+  answer({
+    traceEvents: [...STEPS, ...SAVED_WAKE, ...extraEvents],
+    status: "async_wake",
+  }),
+];
+// Let the page's fetch-then chains finish.
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+test("a notice survives the reload after a background turn is saved", async () => {
+  const client = makeClient();
+  client.liveExchange("q1", answer());
+  client.deliver(NOTICE);
+  client.setServerHistory(serverCopyAfterWake());
+  await client.reload();
+  const saved = client.turn(1);
+  assert.deepEqual(kinds(saved), [
+    "tool_start",
+    "tool_end",
+    "pi_widget:fleet:fleet: 2 running",
+    "tool_start",
+    "tool_end",
+    "pi_notice:Saved",
+  ]);
+  assert.equal(saved.status, "async_wake");
+  assert.ok(saved.traceLines.some((line) => line.includes("Notice: Saved")));
+});
+
+test("a notice the server already saved is not added again", async () => {
+  const client = makeClient();
+  client.liveExchange("q1", answer());
+  client.deliver(NOTICE);
+  const stored = client.turn(1).traceEvents.at(-1);
+  client.setServerHistory(serverCopyAfterWake([stored]));
+  await client.reload();
+  const notices = kinds(client.turn(1)).filter((kind) =>
+    kind.startsWith("pi_notice"),
+  );
+  assert.deepEqual(notices, ["pi_notice:Saved"]);
+});
+
+test("a notice is never put back on a different answer", async () => {
+  const client = makeClient();
+  client.liveExchange("q1", answer());
+  client.deliver(NOTICE);
+  const changed = serverCopyAfterWake();
+  changed[0] = { role: "user", content: "another question" };
+  client.setServerHistory(changed);
+  await client.reload();
+  assert.ok(!kinds(client.turn(1)).includes("pi_notice:Saved"));
+});
+
+test("a notice survives the replay-gap reconcile", async () => {
+  const client = makeClient();
+  client.liveExchange("q1", answer());
+  client.deliver(NOTICE);
+  client.setServerHistory(serverCopyAfterWake());
+  client.deliver({ type: "replay_gap" });
+  await settle();
+  assert.ok(kinds(client.turn(1)).includes("pi_notice:Saved"));
+});
+
+test("a notice shown during a reconcile goes on the reconciled last answer", async () => {
+  const client = makeClient();
+  client.liveExchange("q1", answer());
+  // Meanwhile another window added a turn.
+  client.setServerHistory([
+    { role: "user", content: "q1" },
+    answer(),
+    { role: "user", content: "q2" },
+    answer({ content: "a2" }),
+  ]);
+  client.deliver({ type: "replay_gap" });
+  client.deliver({ ...NOTICE, replay: true });
+  await settle();
+  assert.ok(kinds(client.turn(3)).includes("pi_notice:Saved"));
+  assert.ok(!kinds(client.turn(1)).includes("pi_notice:Saved"));
+});
+
+test("past the server's 200-message limit the notice still comes back", async () => {
+  const client = makeClient();
+  for (let i = 0; i < 100; i += 1) {
+    client.session.history.push(
+      { role: "user", content: `old q${i}` },
+      { role: "assistant", content: `old a${i}` },
+    );
+  }
+  client.liveExchange("q1", answer());
+  // The server keeps only the last 200 messages, without the notice.
+  client.setServerHistory(client.session.history.slice(-200));
+  client.deliver(NOTICE);
+  await client.reload();
+  assert.ok(kinds(client.session.history.at(-1)).includes("pi_notice:Saved"));
+});
+
+// A tool-only answer: no text, recognised by a step it held.
+const toolOnly = (callId, sequence) =>
+  answer({
+    content: "",
+    traceEvents: [
+      { type: "tool_start", toolCallId: callId, epoch: "e1", sequence },
+    ],
+  });
+
+test("an answer with no text gets back only its own notice", async () => {
+  const client = makeClient();
+  client.liveExchange("q1", toolOnly("t1", 1));
+  client.deliver(NOTICE);
+  // Regenerated: same place, same question, a different answer.
+  client.setServerHistory([
+    { role: "user", content: "q1" },
+    toolOnly("t9", 40),
+  ]);
+  await client.reload();
+  assert.ok(!kinds(client.turn(1)).includes("pi_notice:Saved"));
+  // The original answer, filled in by the background turn, gets it back.
+  client.setServerHistory([
+    { role: "user", content: "q1" },
+    { ...toolOnly("t1", 1), content: "wake text" },
+  ]);
+  await client.reload();
+  assert.ok(kinds(client.turn(1)).includes("pi_notice:Saved"));
+});
+
+// The header line of a trace block ("Working…", "Finished in 3s").
+const header = (block) =>
+  block.element.children.find((child) => child.classes.has("thinking"));
+
+test("a finished turn's header says how long it took, not Working", () => {
+  const client = makeClient();
+  const live = client.run("addThinking")({ live: true, modeName: "pi" });
+  assert.match(header(live).textContent, /^Working\.\.\. /);
+  client.run("handleStreamEventTrace")({ type: "done" }, live);
+  assert.match(header(live).textContent, /^Finished in \d+s$/);
+  const stopped = client.run("addThinking")({ live: true, modeName: "pi" });
+  stopped.markFinished("Stopped after");
+  assert.match(header(stopped).textContent, /^Stopped after \d+s$/);
+  const failed = client.run("addThinking")({ live: true, modeName: "pi" });
+  failed.markFailure("boom");
+  failed.markFinished();
+  assert.equal(header(failed).textContent, "Failed — see Execution Trace");
+});
+
+test("a saved turn's trace block shows no Working label", () => {
+  const client = makeClient();
+  const saved = client.run("addThinking")({
+    live: false,
+    modeName: "pi",
+    traceLines: ["Turn: m"],
+  });
+  assert.equal(header(saved).style.display, "none");
+});
+
+test("a trace rebuilt from saved events reads like the live one", () => {
+  const client = makeClient();
+  const { traceLines } = client.run("getAssistantMetadataFromMessage")({
+    role: "assistant",
+    content: "a1",
+    traceEvents: [
+      { type: "pi_usage", model: "m", input: 10, output: 5 },
+      { type: "pi_notice", message: "Saved" },
+      { type: "pi_status", key: "job", text: "done" },
+    ],
+  });
+  assert.deepEqual(traceLines, [
+    "Turn: m · ↑10 · ↓5",
+    "Notice: Saved",
+    "Status · job: done",
+  ]);
+});
+
+test("a notice put back after a reload sits where it happened", async () => {
+  const client = makeClient();
+  client.liveExchange(
+    "q1",
+    answer({
+      traceEvents: [
+        { type: "pi_usage", model: "m", input: 1, epoch: "e1", sequence: 1 },
+      ],
+    }),
+  );
+  client.deliver({ ...NOTICE, sequence: 2 });
+  // The background turn's usage came after the notice.
+  client.setServerHistory([
+    { role: "user", content: "q1" },
+    answer({
+      traceEvents: [
+        { type: "pi_usage", model: "m", input: 1, epoch: "e1", sequence: 1 },
+        { type: "pi_usage", model: "m", input: 2, epoch: "e1", sequence: 3 },
+      ],
+      status: "async_wake",
+    }),
+  ]);
+  await client.reload();
+  assert.deepEqual(client.turn(1).traceLines, [
+    "Turn: m · ↑1",
+    "Notice: Saved",
+    "Turn: m · ↑2",
+  ]);
 });

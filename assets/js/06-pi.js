@@ -297,7 +297,7 @@ function renderPiChannelResponse(run) {
   }
 }
 
-function finalizePiChannelRun(finalResponse) {
+function finalizePiChannelRun(finalResponse, finishedPrefix) {
   const run = piChannelRun;
   piChannelRun = null;
   if (!run) return;
@@ -312,7 +312,7 @@ function finalizePiChannelRun(finalResponse) {
       : run.response || "";
   run.response = responseText;
   run.controller?.finalizeTimeline?.();
-  run.controller?.stopTimer?.();
+  run.controller?.markFinished?.(finishedPrefix);
 
   const nextHistory = [...baseHistory];
   const sources = piChannelSources(run);
@@ -497,13 +497,11 @@ function piTraceBlockPrecedes(controller, bubble) {
   return block.nextElementSibling === bubble.closest(".msg-wrap");
 }
 
-// Whether a replayed passive record is already saved in the conversation. A
-// page load replays every buffered record; the ones an earlier page saved
-// carry their channel epoch and sequence. A widget keeps only its latest
-// frame, so a saved frame of that widget at or after this one covers it.
-function piPassiveRecordSaved(turns, evt) {
-  if (evt.replay !== true || !evt.epoch) return false;
-  if (!Number.isSafeInteger(evt.sequence)) return false;
+// Whether a passive record is in a saved history: same channel epoch, type
+// and sequence. A widget keeps only its latest frame, so a saved frame of that
+// widget at or after this one covers it.
+function piRecordInHistory(turns, evt) {
+  if (!evt.epoch || !Number.isSafeInteger(evt.sequence)) return false;
   return turns.some((message) =>
     (Array.isArray(message?.traceEvents) ? message.traceEvents : []).some(
       (saved) =>
@@ -519,20 +517,130 @@ function piPassiveRecordSaved(turns, evt) {
 
 // An answer's saved trace events plus one passive record, by the rules its
 // live trace block uses (addEvent in 05-history.js): only the latest frame
-// of each widget, and no clear frames.
+// of each widget, and no clear frames. The record goes in the order the
+// channel sent it, so one put back after a reload still reads in order.
+// Returns the events and the stored copy of the record (null if not stored).
 function addPassivePiRecordToEvents(traceEvents, evt) {
   let events = traceEvents;
   if (evt.type === "pi_widget") {
-    if (!Array.isArray(evt.lines) || !evt.lines.length) return events;
+    if (!Array.isArray(evt.lines) || !evt.lines.length) {
+      return { events, record: null };
+    }
     events = events.filter(
       (saved) => !(saved?.type === "pi_widget" && saved.key === evt.key),
     );
   }
-  const copy = { ...evt };
-  delete copy.thinking;
-  delete copy.response;
-  delete copy.sessionId;
-  return [...events, copy];
+  const record = { ...evt };
+  delete record.thinking;
+  delete record.response;
+  delete record.sessionId;
+  const later = events.findIndex(
+    (saved) =>
+      !!evt.epoch &&
+      saved?.epoch === evt.epoch &&
+      Number.isSafeInteger(saved.sequence) &&
+      saved.sequence > evt.sequence,
+  );
+  return {
+    events:
+      later < 0
+        ? [...events, record]
+        : [...events.slice(0, later), record, ...events.slice(later)],
+    record,
+  };
+}
+
+// An answer with one passive record added to its saved trace: the record and
+// the trace lines it showed. Nothing is written over. An answer with saved
+// lines gets them after its own; one whose lines come from its events gets
+// them at the record's place among those events.
+function piAnswerWithRecord(answer, evt, lines) {
+  const { events, record } = addPassivePiRecordToEvents(
+    Array.isArray(answer.traceEvents) ? answer.traceEvents : [],
+    evt,
+  );
+  const savedLines = Array.isArray(answer.traceLines) ? answer.traceLines : [];
+  const traceLines = savedLines.length
+    ? [...savedLines, ...lines]
+    : dedupeStatusTraceLines(
+        events.flatMap((saved) =>
+          saved === record
+            ? lines
+            : [formatStreamEventTraceLine(saved)].filter(Boolean),
+        ),
+      );
+  return { ...answer, traceLines, traceEvents: events };
+}
+
+// Passive records exist only in this page's history until the next message
+// saves it. When the page loads the conversation from the server first (after
+// a background turn is saved, a reconcile, or reopening the conversation),
+// the server's copy lacks them. They are remembered here, with what
+// identifies the answer they belong to, so they can be added back.
+const PI_UNSAVED_RECORDS_MAX = 200;
+
+// Where a remembered record's answer is in a loaded history: in the same
+// place counted from the start, or from the end (the server drops the oldest
+// messages past its limit), after the same question and with the same text.
+// An answer with no text must still hold the step it held then.
+function piRememberedAnswerIndex(turns, entry) {
+  for (const index of [entry.index, turns.length - 1 - entry.fromEnd]) {
+    const answer = turns[index];
+    if (answer?.role !== "assistant") continue;
+    if (turns[index - 1]?.content !== entry.question) continue;
+    const same = entry.content
+      ? answer.content === entry.content
+      : !!entry.marker && piRecordInHistory([answer], entry.marker);
+    if (same) return index;
+  }
+  return -1;
+}
+
+// A history loaded from the server, plus the passive records this page showed
+// that it lacks. It only adds, and only onto the answer a record belongs to.
+// A record found saved is forgotten; one whose answer cannot be found is not
+// placed anywhere else.
+function piWithUnsavedRecords(session, turns) {
+  const remembered = Array.isArray(session.piUnsavedRecords)
+    ? session.piUnsavedRecords
+    : [];
+  let next = turns;
+  const kept = [];
+  for (const entry of remembered) {
+    if (entry.convId !== session.convId) {
+      kept.push(entry);
+      continue;
+    }
+    if (piRecordInHistory(next, entry.evt)) continue;
+    kept.push(entry);
+    const index = piRememberedAnswerIndex(next, entry);
+    if (index < 0) continue;
+    if (next === turns) next = [...turns];
+    next[index] = piAnswerWithRecord(next[index], entry.evt, entry.lines);
+  }
+  session.piUnsavedRecords = kept;
+  return next;
+}
+
+// Remember a passive record saved into the page's history at turns[index].
+function rememberUnsavedPiRecord(session, entry) {
+  if (!Array.isArray(session.piUnsavedRecords)) session.piUnsavedRecords = [];
+  if (entry.evt.type === "pi_widget") {
+    session.piUnsavedRecords = session.piUnsavedRecords.filter(
+      (r) =>
+        !(
+          r.convId === entry.convId &&
+          r.evt.type === "pi_widget" &&
+          r.evt.key === entry.evt.key
+        ),
+    );
+  }
+  const records = session.piUnsavedRecords;
+  records.push(entry);
+  const ofThisConversation = records.filter((r) => r.convId === entry.convId);
+  if (ofThisConversation.length > PI_UNSAVED_RECORDS_MAX) {
+    records.splice(records.indexOf(ofThisConversation[0]), 1);
+  }
 }
 
 // Show a passive record and save it with the last answer, at once. It is only
@@ -542,10 +650,9 @@ function addPassivePiRecordToEvents(traceEvents, evt) {
 // of its own above the answer.
 function addPassivePiRecord(session, evt) {
   const turns = Array.isArray(session.history) ? session.history : [];
-  if (piPassiveRecordSaved(turns, evt)) return;
-  // A history reconcile in flight will replace the history this is saved
-  // into; it is applied again once that lands.
-  session.piReplayedDuringReconcile?.push(evt);
+  // A page load replays every buffered record; the ones already saved are
+  // not added again.
+  if (evt.replay === true && piRecordInHistory(turns, evt)) return;
   const { index, bubble } = piLastAnswer(turns);
   let block = [session.lastThinkingController, session.piPassiveBlock].find(
     (candidate) => piTraceBlockPrecedes(candidate, bubble),
@@ -572,26 +679,41 @@ function addPassivePiRecord(session, evt) {
   const linesBefore = block.getSnapshot().traceLines.length;
   handleStreamEventTrace(evt, block);
   if (index < 0) return;
+  const lines = block.getSnapshot().traceLines.slice(linesBefore);
   const answer = turns[index];
-  const savedLines =
-    Array.isArray(answer.traceLines) && answer.traceLines.length
-      ? answer.traceLines
-      : getAssistantMetadataFromMessage(answer).traceLines;
   const next = [...turns];
-  next[index] = {
-    ...answer,
-    traceLines: [
-      ...savedLines,
-      ...block.getSnapshot().traceLines.slice(linesBefore),
-    ],
-    traceEvents: addPassivePiRecordToEvents(
-      Array.isArray(answer.traceEvents) ? answer.traceEvents : [],
-      evt,
-    ),
-  };
+  next[index] = piAnswerWithRecord(answer, evt, lines);
   session.history = next;
   if (mode === "pi" && currentConvId === session.convId) {
     history = [...next];
+  }
+  // Only a record that can be recognised once saved (epoch and sequence),
+  // and that adds something (a clear frame does not), is remembered.
+  const clearFrame =
+    evt.type === "pi_widget" && !(Array.isArray(evt.lines) && evt.lines.length);
+  if (clearFrame || !evt.epoch || !Number.isSafeInteger(evt.sequence)) return;
+  const entry = {
+    convId: session.convId,
+    index,
+    fromEnd: turns.length - 1 - index,
+    question: turns[index - 1]?.content,
+    content: answer.content,
+    // A step the answer already held, to recognise one with no text.
+    marker: (Array.isArray(answer.traceEvents) ? answer.traceEvents : []).find(
+      (saved) =>
+        saved?.epoch &&
+        Number.isSafeInteger(saved.sequence) &&
+        saved.type !== "pi_widget",
+    ),
+    evt,
+    lines,
+  };
+  // A reconcile in flight is about to replace this history, perhaps with
+  // newer answers; the record is run again against what it brings.
+  if (session.piRecordsDuringReconcile) {
+    session.piRecordsDuringReconcile.push(entry);
+  } else {
+    rememberUnsavedPiRecord(session, entry);
   }
 }
 
@@ -619,7 +741,7 @@ function handlePiChannelEvent(evt) {
   if (evt.type === "replay_gap") {
     if (!session.piReplayReconcile) {
       session.piReplayReconcile = true;
-      session.piReplayedDuringReconcile = [];
+      session.piRecordsDuringReconcile = [];
       fetch(
         apiUrl("/api/conversations/id/" + encodeURIComponent(session.convId)),
       )
@@ -632,20 +754,26 @@ function handlePiChannelEvent(evt) {
             !piChannelRun &&
             Array.isArray(conversation?.history)
           ) {
-            session.history = [...conversation.history];
+            session.history = piWithUnsavedRecords(session, [
+              ...conversation.history,
+            ]);
             history = [...session.history];
             renderSessionTranscript(session);
-            // Records shown while the fetch was out were saved into the
-            // history it just replaced.
-            const replayed = session.piReplayedDuringReconcile || [];
-            session.piReplayedDuringReconcile = null;
-            replayed.forEach((record) => addPassivePiRecord(session, record));
+            // Records shown while the fetch was out go to the last answer
+            // of the history it brought.
+            const during = session.piRecordsDuringReconcile || [];
+            session.piRecordsDuringReconcile = null;
+            during.forEach((entry) => addPassivePiRecord(session, entry.evt));
           }
         })
         .catch(uiRefreshFailed("Pi history reconcile"))
         .finally(() => {
           session.piReplayReconcile = false;
-          session.piReplayedDuringReconcile = null;
+          // Not reconciled: their history was kept, so remember them as is.
+          (session.piRecordsDuringReconcile || []).forEach((entry) =>
+            rememberUnsavedPiRecord(session, entry),
+          );
+          session.piRecordsDuringReconcile = null;
         });
     }
     return;
@@ -760,9 +888,7 @@ function handlePiChannelEvent(evt) {
     return;
   }
   if (evt.type === "error") {
-    run.controller?.addTraceLine(`Error: ${evt.error || "unknown"}`, {
-      failure: true,
-    });
+    run.controller?.markFailure?.(evt.error || "unknown");
     finalizePiChannelRun();
     return;
   }
