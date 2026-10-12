@@ -397,6 +397,11 @@ textarea {
   align-items: center;
   padding: 0 10px;
 }
+/* The tokens cell is a flex box, which drops the spaces around the slash;
+         pre keeps them. */
+.token-counter-sep {
+  white-space: pre;
+}
 .token-counter-percent {
   display: flex;
   align-items: center;
@@ -413,6 +418,20 @@ textarea {
 #tokenCounter.critical .token-counter-percent {
   color: #fff;
   background: #e53935;
+}
+/* A figure nobody has measured yet is left empty and drawn as a dot. The
+         dot is a pseudo-element, which the square-corner rule (*) does not
+         reach. */
+.token-counter-percent:empty::before,
+.token-counter-used:empty::before,
+.token-counter-total:empty::before,
+.side-pi-state-value:empty::before {
+  content: "";
+  display: block;
+  width: calc(5px * var(--font-scale, 1));
+  height: calc(5px * var(--font-scale, 1));
+  border-radius: 50%;
+  background: currentColor;
 }
 .mode-status {
   justify-content: flex-start;
@@ -702,34 +721,43 @@ textarea {
   opacity: 0.6;
   margin-bottom: 7px;
 }
+/* Pi's figures in the token counter's style, stretched to the panel: each
+         is a solid cell with its name, joined to its value inside one frame.
+         The names share one column (subgrid), so the values line up in any
+         font. */
 .side-pi-state-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 7px 14px;
-  margin-top: 9px;
+  grid-template-columns: max-content minmax(0, 1fr);
+  row-gap: 6px;
+  margin-top: 10px;
 }
 .side-pi-state-item {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+  min-height: calc(24px * var(--font-scale, 1));
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text-inverse);
+  border: max(var(--border-width), 2px) solid currentColor;
 }
 .side-pi-state-key {
-  font-size: calc(9px * var(--font-scale, 1));
-  letter-spacing: 1.2px;
-  font-weight: 700;
-  color: var(--text-inverse);
-  opacity: 0.5;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  font-size: calc(10px * var(--font-scale, 1));
+  letter-spacing: 1px;
+  color: var(--bg-inverse);
+  background: var(--text-inverse);
 }
 .side-pi-state-value {
+  align-self: center;
   min-width: 0;
+  padding: 0 8px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: calc(10px * var(--font-scale, 1));
-  letter-spacing: 0.5px;
-  color: var(--text-inverse);
-  opacity: 0.82;
 }
 .side-box {
   border: var(--border-width) solid var(--border-color);

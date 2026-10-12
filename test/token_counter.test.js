@@ -2,9 +2,10 @@
 // "used / total".
 //
 // What it must get right:
-// - the percentage is the one Pi's side panel shows for the same figures;
+// - the percentage is the one Pi itself reports for the same figures;
 // - from 90.0% (as displayed) it turns red, and below it does not;
-// - what nobody has measured reads as unknown ("--%", "?"), never as 0 or as
+// - what nobody has measured reads as unknown (an empty cell, which the
+//   stylesheet draws as a dot; "•" below), never as 0 or as
 //   the previous conversation's figure;
 // - a Pi status that answers for a session the page has left, or for one
 //   still loading into Pi, never lands on the conversation on screen.
@@ -43,11 +44,15 @@ const THEME = read("03-theme.js");
 function makeCounter() {
   const cell = (cls) => ({ className: cls, textContent: "" });
   const percent = cell("token-counter-percent");
-  const tokens = cell("token-counter-tokens");
+  const used = cell("token-counter-used");
+  const total = cell("token-counter-total");
   const classes = new Set();
+  // An empty cell is drawn as a dot on screen; "•" stands for it here.
+  const shown = (c) => c.textContent || "•";
   return {
     percent,
-    tokens,
+    used,
+    total,
     title: "",
     classList: {
       add: (name) => classes.add(name),
@@ -57,14 +62,15 @@ function makeCounter() {
     },
     querySelector(selector) {
       if (selector === ".token-counter-percent") return percent;
-      if (selector === ".token-counter-tokens") return tokens;
+      if (selector === ".token-counter-used") return used;
+      if (selector === ".token-counter-total") return total;
       return null;
     },
     get critical() {
       return classes.has("critical");
     },
     get text() {
-      return `${percent.textContent} | ${tokens.textContent}`;
+      return `${shown(percent)} | ${shown(used)} / ${shown(total)}`;
     },
   };
 }
@@ -123,18 +129,18 @@ const render = (app, used, total) =>
     `renderTokenCounter(document.getElementById("tokenCounter"), ${JSON.stringify(used)}, ${JSON.stringify(total)})`,
   );
 
-test("the percentage is the side panel's figure for the same tokens", () => {
+test("the percentage is Pi's own figure for the same tokens", () => {
   const app = makeApp();
-  // The side panel prints Pi's own percent, tokens / window * 100, to one
+  // Pi reports its own percent, tokens / window * 100, printed to one
   // decimal place. Sweep sizes from a small local window to a large cloud one.
   for (const total of [4096, 8192, 32768, 131072, 200000, 272000, 1000000]) {
     for (let i = 0; i <= 400; i++) {
       const used = Math.round((total * i) / 400);
       render(app, used, total);
-      const sidePanel = `${((used / total) * 100).toFixed(1)}%`;
+      const piPercent = `${((used / total) * 100).toFixed(1)}%`;
       assert.strictEqual(
         app.counter.percent.textContent,
-        sidePanel,
+        piPercent,
         `${used} / ${total}`,
       );
     }
@@ -172,14 +178,14 @@ test("usage past the window reads 100.0%, never more", () => {
 test("anything unmeasured reads as unknown, not as 0", () => {
   const app = makeApp();
   render(app, null, 272000);
-  assert.strictEqual(app.counter.text, "--% | ? / 272,000");
+  assert.strictEqual(app.counter.text, "• | • / 272,000");
   assert.strictEqual(app.counter.critical, false);
 
   render(app, 500, null);
-  assert.strictEqual(app.counter.text, "--% | 500 / ?");
+  assert.strictEqual(app.counter.text, "• | 500 / •");
 
   render(app, null, null);
-  assert.strictEqual(app.counter.text, "--% | ? / ?");
+  assert.strictEqual(app.counter.text, "• | • / •");
 
   // A red counter whose figures become unknown is no longer red.
   render(app, 266560, 272000);
@@ -213,7 +219,7 @@ test("opening a conversation drops the previous one's usage", async () => {
     `history = [{ role: "user", content: "x" }]; forgetTokenUsage("ollama")`,
   );
   await app.run(`updateTokenCounter()`);
-  assert.strictEqual(app.counter.text, "--% | ? / 8,192");
+  assert.strictEqual(app.counter.text, "• | • / 8,192");
 
   // An empty conversation uses nothing.
   app.run(`history = []`);
@@ -229,7 +235,7 @@ test("a window update keeps unmeasured usage unmeasured", async () => {
   await app.run(
     `updateTokenCounter("llamacpp", llamacppTokenState.used, 65536)`,
   );
-  assert.strictEqual(app.counter.text, "--% | ? / 65,536");
+  assert.strictEqual(app.counter.text, "• | • / 65,536");
   assert.strictEqual(app.run("llamacppTokenState.used"), null);
 });
 
@@ -285,7 +291,7 @@ test("Pi's unknown usage after a compaction shows as unknown", async () => {
     { ...app.run("piTokenState") },
     { used: null, total: 272000 },
   );
-  assert.strictEqual(app.counter.text, "--% | ? / 272,000");
+  assert.strictEqual(app.counter.text, "• | • / 272,000");
   assert.strictEqual(app.counter.critical, false);
 });
 
@@ -332,7 +338,7 @@ test("the counter never asks Pi itself", () => {
     updateTokenCounter();
   `);
   assert.strictEqual(app.fetches.length, 0);
-  assert.strictEqual(app.counter.text, "--% | ? / ?");
+  assert.strictEqual(app.counter.text, "• | • / •");
 });
 
 test("switching Pi chats shows unknown until Pi answers for the new one", async () => {
@@ -362,7 +368,7 @@ test("switching Pi chats shows unknown until Pi answers for the new one", async 
   const refreshing = app.run(`refreshPiStatus()`);
   assert.strictEqual(
     app.counter.text,
-    "--% | ? / ?",
+    "• | • / •",
     "conv_a's figure stayed up while Pi was asked about conv_b",
   );
   release();
