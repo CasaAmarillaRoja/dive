@@ -1319,22 +1319,23 @@ function forgetTokenUsage(modeId) {
 }
 
 // The counter is a split label: the share of the context window in use, in a
-// solid cell, joined to "used / total". The percentage is worded as Pi's side
-// panel words its CONTEXT figure, so the two always agree. From 90% the cell
-// and frame turn red. It reads "--%" while either figure is unknown, with "?"
-// in place of the unknown one.
+// solid cell, joined to "used / total". The percentage is worded as Pi words
+// its own context figure, so the two always agree. From 90% the cell and frame
+// turn red. A figure that is unknown is left empty, and the stylesheet draws
+// an empty cell as a dot: the percentage while either figure is unknown, and
+// the unknown figure itself.
 const TOKEN_COUNTER_CRITICAL_PERCENT = 90;
 function renderTokenCounter(counterEl, used, total) {
   const percentEl = counterEl.querySelector(".token-counter-percent");
-  const tokensEl = counterEl.querySelector(".token-counter-tokens");
+  const usedEl = counterEl.querySelector(".token-counter-used");
+  const totalEl = counterEl.querySelector(".token-counter-total");
   const knownUsed = typeof used === "number" && Number.isFinite(used);
   const knownTotal = typeof total === "number" && total > 0;
   const fmt = (n) => Math.max(0, Math.round(n)).toLocaleString("en-US");
-  const usedText = knownUsed ? fmt(used) : "?";
-  const totalText = knownTotal ? fmt(total) : "?";
-  tokensEl.textContent = `${usedText} / ${totalText}`;
+  usedEl.textContent = knownUsed ? fmt(used) : "";
+  totalEl.textContent = knownTotal ? fmt(total) : "";
   if (!knownUsed || !knownTotal) {
-    percentEl.textContent = "--%";
+    percentEl.textContent = "";
     counterEl.classList.remove("critical");
     counterEl.title = "Token Usage";
     return;

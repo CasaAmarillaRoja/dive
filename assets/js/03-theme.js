@@ -2687,13 +2687,12 @@ async function refreshPiStatus() {
     }
     const stateLine = document.getElementById("sidePiStateLine");
     if (stateLine) {
+      // An empty value is drawn as a dot. Context usage is not repeated here:
+      // the token counter in the top bar shows it.
       const setStateValue = (key, value) => {
         const target = stateLine.querySelector(`[data-pi-state="${key}"]`);
         if (target) target.textContent = value;
       };
-      // null after a compaction: unknown until the next reply.
-      const rawPercent = piStatusInfo?.contextUsage?.percent;
-      const contextPercent = rawPercent == null ? NaN : Number(rawPercent);
       setStateValue(
         "runtime",
         piStatusInfo?.isLocal === true ? "LOCAL" : "CLOUD",
@@ -2702,15 +2701,9 @@ async function refreshPiStatus() {
         "cost",
         piStatusInfo?.cost && piStatusInfo.cost !== "Local"
           ? piStatusInfo.cost
-          : "—",
+          : "",
       );
       setStateValue("state", piStatusInfo?.state || "IDLE");
-      setStateValue(
-        "context",
-        Number.isFinite(contextPercent)
-          ? `${contextPercent.toFixed(1)}%`
-          : "--",
-      );
     }
     // Keep the shared model dropdown in sync with Pi's actual model.
     if (piStatusInfo?.provider && piStatusInfo?.model) {
@@ -2728,7 +2721,7 @@ async function refreshPiStatus() {
     if (payload?.status) {
       piTokenState = piTokenStateFromUsage(payload.status.contextUsage);
       // The status usually lands after the reply has settled, so redraw the
-      // token counter or it keeps the pre-reply "0 / ?".
+      // token counter or it keeps the pre-reply count with no window size.
       updateTokenCounter();
     }
     updateModeStatus();
